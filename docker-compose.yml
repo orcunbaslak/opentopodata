@@ -1,0 +1,10 @@
+services:
+  opentopodata:
+    image: opentopodata:optimized
+    container_name: opentopodata
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - /var/opentopodata/data:/app/data:ro
+      - /var/opentopodata/config.yaml:/app/config.yaml:ro

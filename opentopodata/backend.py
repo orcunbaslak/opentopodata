@@ -106,6 +106,83 @@ def _validate_points_lie_within_raster(xs, ys, lats, lons, bounds, res):
     return sorted(oob_indices)
 
 
+def _batch_bilinear(data, rows, cols):
+    """Bilinear interpolation for arrays of fractional row/col coordinates.
+
+    Args:
+        data: 2D numpy array (the raster window).
+        rows, cols: 1D arrays of fractional pixel coordinates relative to data.
+
+    Returns:
+        List of interpolated float values (NaN where input is NaN).
+    """
+    h, w = data.shape
+    r0 = np.floor(rows).astype(int).clip(0, h - 2)
+    c0 = np.floor(cols).astype(int).clip(0, w - 2)
+    dr = rows - r0
+    dc = cols - c0
+
+    # Four corners.
+    v00 = data[r0, c0]
+    v01 = data[r0, c0 + 1]
+    v10 = data[r0 + 1, c0]
+    v11 = data[r0 + 1, c0 + 1]
+
+    z = (v00 * (1 - dr) * (1 - dc) +
+         v01 * (1 - dr) * dc +
+         v10 * dr * (1 - dc) +
+         v11 * dr * dc)
+
+    return [float(v) for v in z]
+
+
+def _batch_cubic(data, rows, cols):
+    """Cubic (Catmull-Rom) interpolation for arrays of fractional row/col coordinates.
+
+    Args:
+        data: 2D numpy array (the raster window).
+        rows, cols: 1D arrays of fractional pixel coordinates relative to data.
+
+    Returns:
+        List of interpolated float values.
+    """
+    h, w = data.shape
+    r0 = np.floor(rows).astype(int)
+    c0 = np.floor(cols).astype(int)
+    dr = rows - r0
+    dc = cols - c0
+
+    results = np.empty(len(rows), dtype=float)
+    for idx in range(len(rows)):
+        # 4x4 neighborhood centered on the pixel.
+        rr = r0[idx]
+        cc = c0[idx]
+        row_indices = np.clip([rr - 1, rr, rr + 1, rr + 2], 0, h - 1)
+        col_indices = np.clip([cc - 1, cc, cc + 1, cc + 2], 0, w - 1)
+        patch = data[np.ix_(row_indices, col_indices)]
+
+        # Catmull-Rom weights.
+        t = dr[idx]
+        wr = _cubic_weights(t)
+        t = dc[idx]
+        wc = _cubic_weights(t)
+
+        results[idx] = wr @ patch @ wc
+
+    return [float(v) for v in results]
+
+
+def _cubic_weights(t):
+    """Catmull-Rom spline weights for offset t in [0, 1]."""
+    t2 = t * t
+    t3 = t2 * t
+    w0 = -0.5 * t3 + t2 - 0.5 * t
+    w1 = 1.5 * t3 - 2.5 * t2 + 1.0
+    w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t
+    w3 = 0.5 * t3 - 0.5 * t2
+    return np.array([w0, w1, w2, w3])
+
+
 def _get_elevation_from_path(lats, lons, path, interpolation):
     """Read values at locations in a raster.
 
@@ -162,27 +239,51 @@ def _get_elevation_from_path(lats, lons, path, interpolation):
                     z = float(val[0]) if val[0] is not np.ma.masked else np.nan
                     z_all.append(z)
         else:
-            # Fallback to per-point windowed reads for bilinear/cubic.
-            rows = rows - 0.5
-            cols = cols - 0.5
-            rows = rows.clip(0, f.height - 1)
-            cols = cols.clip(0, f.width - 1)
+            # Batch read for bilinear/cubic: read bounding window once,
+            # then interpolate all points in numpy.
+            oob_set = set(oob_indices)
+            valid_mask = np.array([i not in oob_set for i in range(len(rows))])
 
-            for i, (row, col) in enumerate(zip(rows, cols)):
-                if i in oob_indices:
-                    z_all.append(None)
-                    continue
-                window = rasterio.windows.Window(col, row, 1, 1)
-                z_array = f.read(
-                    indexes=1,
-                    window=window,
-                    resampling=interpolation,
-                    out_dtype=float,
-                    boundless=True,
-                    masked=True,
-                )
-                z = np.ma.filled(z_array, np.nan)[0][0]
-                z_all.append(z)
+            if not np.any(valid_mask):
+                z_all = [None] * len(rows)
+            else:
+                # Convert pixel indices to fractional row/col (center-based).
+                frows = rows[valid_mask] - 0.5
+                fcols = cols[valid_mask] - 0.5
+                frows = frows.clip(0, f.height - 1)
+                fcols = fcols.clip(0, f.width - 1)
+
+                # Determine padding for interpolation kernel.
+                pad = 1 if interpolation == Resampling.bilinear else 2
+
+                # Bounding window over all valid points, with padding.
+                r_min = max(int(np.floor(frows.min())) - pad, 0)
+                r_max = min(int(np.ceil(frows.max())) + pad + 1, f.height)
+                c_min = max(int(np.floor(fcols.min())) - pad, 0)
+                c_max = min(int(np.ceil(fcols.max())) + pad + 1, f.width)
+
+                window = rasterio.windows.Window(c_min, r_min, c_max - c_min, r_max - r_min)
+                data = f.read(indexes=1, window=window, out_dtype=float, boundless=True, masked=True)
+                data = np.ma.filled(data, np.nan)
+
+                # Coordinates relative to the window origin.
+                lr = frows - r_min
+                lc = fcols - c_min
+
+                if interpolation == Resampling.bilinear:
+                    valid_z = _batch_bilinear(data, lr, lc)
+                else:
+                    valid_z = _batch_cubic(data, lr, lc)
+
+                # Merge back with oob points.
+                z_all = [None] * len(rows)
+                vi = 0
+                for i in range(len(rows)):
+                    if i in oob_set:
+                        z_all[i] = None
+                    else:
+                        z_all[i] = valid_z[vi]
+                        vi += 1
 
     # Depending on the file format, when rasterio finds an invalid projection
     # of file, it might load it with a None crs, or it might throw an error.

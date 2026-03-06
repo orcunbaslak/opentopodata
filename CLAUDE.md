@@ -13,19 +13,20 @@ Self-hosted elevation API serving Copernicus GLO-30 DEM (30m global resolution) 
 
 ## Quick Reference
 
-### Start the server
+### Start / stop / restart
 ```bash
-docker run --rm -d --name opentopodata \
-  -v /var/opentopodata/data:/app/data:ro \
-  -v /var/opentopodata/config.yaml:/app/config.yaml:ro \
-  -p 5000:5000 opentopodata:optimized
+cd /opt/opentopodata
+docker compose up -d      # start
+docker compose down        # stop
+docker compose restart     # restart
+docker compose logs -f     # tail logs
 ```
 
 ### Rebuild after code changes
 ```bash
-cd /opt/opentopodata && docker build -t opentopodata:optimized -f docker/Dockerfile .
-docker rm -f opentopodata
-# Then run the start command above
+cd /opt/opentopodata
+docker build -t opentopodata:optimized -f docker/Dockerfile .
+docker compose up -d --force-recreate
 ```
 
 ### Test
