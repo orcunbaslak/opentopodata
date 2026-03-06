@@ -146,7 +146,7 @@ def _find_request_argument(request, arg):
             json_data = request.get_json()
             if arg in json_data:
                 return str(json_data[arg])
-        except:
+        except (ValueError, TypeError):
             raise ClientError("Invalid JSON.")
 
 
@@ -463,7 +463,7 @@ def _get_datasets(name):
     # Ensure uniqueness after resolving multidatasets.
     dataset_names = [d.name for d in datasets]
     if len(dataset_names) > len(set(dataset_names)):
-        raise ConfigError("Datasets must be unique after resolving MultiDatasets.")
+        raise config.ConfigError("Datasets must be unique after resolving MultiDatasets.")
 
     return datasets
 

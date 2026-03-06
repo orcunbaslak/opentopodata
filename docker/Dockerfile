@@ -32,7 +32,7 @@ RUN pip install \
         uwsgi regex && \
     pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.txt && \
         rm -rf /root/.cache/pip/* && \
-        rm root/wheels/* && \
+        rm -rf /root/wheels && \
         rm /app/requirements.txt
 
 WORKDIR /app

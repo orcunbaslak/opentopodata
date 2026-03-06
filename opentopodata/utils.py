@@ -91,12 +91,21 @@ def fill_na(a, value):
 
     Args:
         a: Iterable, possibly containing NaN items.
-        value: WHat NaN values should be replaced with.
+        value: What NaN values should be replaced with.
 
     Returns:
         List same length as a, with NaN values replaced.
     """
-    return [value if safe_is_nan(x) else x for x in a]
+    if value is None:
+        return list(a)
+
+    result = []
+    for x in a:
+        if isinstance(x, float) and math.isnan(x):
+            result.append(value)
+        else:
+            result.append(x)
+    return result
 
 
 def sample_points_on_path(path_lats, path_lons, n_samples):
