@@ -1,4 +1,5 @@
 import collections
+import threading
 
 from rasterio.enums import Resampling
 import numpy as np
@@ -17,6 +18,42 @@ INTERPOLATION_METHODS = {
     # 'cubic_spline': Resampling.cubic_spline,
     # 'lanczos': Resampling.lanczos,
 }
+
+
+class _RasterioLRU:
+    """LRU cache for open rasterio file handles.
+
+    Keeps up to maxsize dataset handles open to avoid repeated open/close
+    overhead (header parsing, GDAL driver init). Evicted handles are closed.
+    """
+
+    def __init__(self, maxsize=128):
+        self._cache = collections.OrderedDict()
+        self._maxsize = maxsize
+        self._lock = threading.Lock()
+
+    def open(self, path):
+        with self._lock:
+            if path in self._cache:
+                self._cache.move_to_end(path)
+                return self._cache[path]
+        # Open outside the lock to avoid blocking other threads during I/O.
+        f = rasterio.open(path)
+        with self._lock:
+            # Another thread may have opened the same path while we were
+            # waiting. If so, close our duplicate and use theirs.
+            if path in self._cache:
+                f.close()
+                self._cache.move_to_end(path)
+                return self._cache[path]
+            self._cache[path] = f
+            while len(self._cache) > self._maxsize:
+                _, evicted = self._cache.popitem(last=False)
+                evicted.close()
+            return f
+
+
+_RASTERIO_CACHE = _RasterioLRU(maxsize=256)
 
 
 class InputError(ValueError):
@@ -69,6 +106,83 @@ def _validate_points_lie_within_raster(xs, ys, lats, lons, bounds, res):
     return sorted(oob_indices)
 
 
+def _batch_bilinear(data, rows, cols):
+    """Bilinear interpolation for arrays of fractional row/col coordinates.
+
+    Args:
+        data: 2D numpy array (the raster window).
+        rows, cols: 1D arrays of fractional pixel coordinates relative to data.
+
+    Returns:
+        List of interpolated float values (NaN where input is NaN).
+    """
+    h, w = data.shape
+    r0 = np.floor(rows).astype(int).clip(0, h - 2)
+    c0 = np.floor(cols).astype(int).clip(0, w - 2)
+    dr = rows - r0
+    dc = cols - c0
+
+    # Four corners.
+    v00 = data[r0, c0]
+    v01 = data[r0, c0 + 1]
+    v10 = data[r0 + 1, c0]
+    v11 = data[r0 + 1, c0 + 1]
+
+    z = (v00 * (1 - dr) * (1 - dc) +
+         v01 * (1 - dr) * dc +
+         v10 * dr * (1 - dc) +
+         v11 * dr * dc)
+
+    return [float(v) for v in z]
+
+
+def _batch_cubic(data, rows, cols):
+    """Cubic (Catmull-Rom) interpolation for arrays of fractional row/col coordinates.
+
+    Args:
+        data: 2D numpy array (the raster window).
+        rows, cols: 1D arrays of fractional pixel coordinates relative to data.
+
+    Returns:
+        List of interpolated float values.
+    """
+    h, w = data.shape
+    r0 = np.floor(rows).astype(int)
+    c0 = np.floor(cols).astype(int)
+    dr = rows - r0
+    dc = cols - c0
+
+    results = np.empty(len(rows), dtype=float)
+    for idx in range(len(rows)):
+        # 4x4 neighborhood centered on the pixel.
+        rr = r0[idx]
+        cc = c0[idx]
+        row_indices = np.clip([rr - 1, rr, rr + 1, rr + 2], 0, h - 1)
+        col_indices = np.clip([cc - 1, cc, cc + 1, cc + 2], 0, w - 1)
+        patch = data[np.ix_(row_indices, col_indices)]
+
+        # Catmull-Rom weights.
+        t = dr[idx]
+        wr = _cubic_weights(t)
+        t = dc[idx]
+        wc = _cubic_weights(t)
+
+        results[idx] = wr @ patch @ wc
+
+    return [float(v) for v in results]
+
+
+def _cubic_weights(t):
+    """Catmull-Rom spline weights for offset t in [0, 1]."""
+    t2 = t * t
+    t3 = t2 * t
+    w0 = -0.5 * t3 + t2 - 0.5 * t
+    w1 = 1.5 * t3 - 2.5 * t2 + 1.0
+    w2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t
+    w3 = 0.5 * t3 - 0.5 * t2
+    return np.array([w0, w1, w2, w3])
+
+
 def _get_elevation_from_path(lats, lons, path, interpolation):
     """Read values at locations in a raster.
 
@@ -86,69 +200,90 @@ def _get_elevation_from_path(lats, lons, path, interpolation):
     lats = np.asarray(lats)
 
     try:
-        with rasterio.open(path) as f:
-            if f.crs is None:
-                msg = "Dataset has no coordinate reference system."
-                msg += f" Check the file '{path}' is a geo raster."
-                msg += " Otherwise you'll have to add the crs manually with a tool like gdaltranslate."
-                raise InputError(msg)
+        f = _RASTERIO_CACHE.open(path)
 
-            try:
-                if f.crs.is_epsg_code:
-                    xs, ys = utils.reproject_latlons(lats, lons, epsg=f.crs.to_epsg())
-                else:
-                    xs, ys = utils.reproject_latlons(lats, lons, wkt=f.crs.to_wkt())
-            except ValueError:
-                raise InputError("Unable to transform latlons to dataset projection.")
+        if f.crs is None:
+            msg = "Dataset has no coordinate reference system."
+            msg += f" Check the file '{path}' is a geo raster."
+            msg += " Otherwise you'll have to add the crs manually with a tool like gdaltranslate."
+            raise InputError(msg)
 
-            # Check bounds.
-            oob_indices = _validate_points_lie_within_raster(
-                xs, ys, lats, lons, f.bounds, f.res
-            )
-            print(f"{xs=}")
-            print(f"{ys=}")
-            tmp = f.index(xs.tolist(), ys.tolist(), op=_noop)
-            print(f"{tmp=}")
-            rows, cols = tuple(tmp)
+        try:
+            if f.crs.is_epsg_code:
+                xs, ys = utils.reproject_latlons(lats, lons, epsg=f.crs.to_epsg())
+            else:
+                xs, ys = utils.reproject_latlons(lats, lons, wkt=f.crs.to_wkt())
+        except ValueError:
+            raise InputError("Unable to transform latlons to dataset projection.")
 
-            # rows, cols = tuple(f.index(xs, ys, op=_noop))
+        # Check bounds.
+        oob_indices = _validate_points_lie_within_raster(
+            xs, ys, lats, lons, f.bounds, f.res
+        )
+        rows, cols = tuple(f.index(xs.tolist(), ys.tolist(), op=_noop))
 
-            # Different versions of rasterio may or may not collapse single
-            # f.index() lookups into scalars. We want to always have an
-            # array.
-            rows = np.atleast_1d(rows)
-            cols = np.atleast_1d(cols)
+        # Different versions of rasterio may or may not collapse single
+        # f.index() lookups into scalars. We want to always have an
+        # array.
+        rows = np.atleast_1d(rows)
+        cols = np.atleast_1d(cols)
 
-            # Offset by 0.5 to convert from center coords (provided by
-            # f.index) to ul coords (expected by f.read).
-            rows = rows - 0.5
-            cols = cols - 0.5
-
-            # Because of floating point precision, indices may slightly exceed
-            # array bounds. Because we've checked the locations are within the
-            # file bounds,  it's safe to clip to the array shape.
-            rows = rows.clip(0, f.height - 1)
-            cols = cols.clip(0, f.width - 1)
-
-            # Read the locations, using a 1x1 window. The `masked` kwarg makes
-            # rasterio replace NODATA values with np.nan. The `boundless` kwarg
-            # forces the windowed elevation to be a 1x1 array, even when it all
-            # values are NODATA.
-            for i, (row, col) in enumerate(zip(rows, cols)):
+        # Use batch sampling for nearest interpolation (much faster).
+        if interpolation == Resampling.nearest:
+            xy_coords = list(zip(xs, ys))
+            sampled = list(f.sample(xy_coords, indexes=1, masked=True))
+            for i, val in enumerate(sampled):
                 if i in oob_indices:
                     z_all.append(None)
-                    continue
-                window = rasterio.windows.Window(col, row, 1, 1)
-                z_array = f.read(
-                    indexes=1,
-                    window=window,
-                    resampling=interpolation,
-                    out_dtype=float,
-                    boundless=True,
-                    masked=True,
-                )
-                z = np.ma.filled(z_array, np.nan)[0][0]
-                z_all.append(z)
+                else:
+                    z = float(val[0]) if val[0] is not np.ma.masked else np.nan
+                    z_all.append(z)
+        else:
+            # Batch read for bilinear/cubic: read bounding window once,
+            # then interpolate all points in numpy.
+            oob_set = set(oob_indices)
+            valid_mask = np.array([i not in oob_set for i in range(len(rows))])
+
+            if not np.any(valid_mask):
+                z_all = [None] * len(rows)
+            else:
+                # Convert pixel indices to fractional row/col (center-based).
+                frows = rows[valid_mask] - 0.5
+                fcols = cols[valid_mask] - 0.5
+                frows = frows.clip(0, f.height - 1)
+                fcols = fcols.clip(0, f.width - 1)
+
+                # Determine padding for interpolation kernel.
+                pad = 1 if interpolation == Resampling.bilinear else 2
+
+                # Bounding window over all valid points, with padding.
+                r_min = max(int(np.floor(frows.min())) - pad, 0)
+                r_max = min(int(np.ceil(frows.max())) + pad + 1, f.height)
+                c_min = max(int(np.floor(fcols.min())) - pad, 0)
+                c_max = min(int(np.ceil(fcols.max())) + pad + 1, f.width)
+
+                window = rasterio.windows.Window(c_min, r_min, c_max - c_min, r_max - r_min)
+                data = f.read(indexes=1, window=window, out_dtype=float, boundless=True, masked=True)
+                data = np.ma.filled(data, np.nan)
+
+                # Coordinates relative to the window origin.
+                lr = frows - r_min
+                lc = fcols - c_min
+
+                if interpolation == Resampling.bilinear:
+                    valid_z = _batch_bilinear(data, lr, lc)
+                else:
+                    valid_z = _batch_cubic(data, lr, lc)
+
+                # Merge back with oob points.
+                z_all = [None] * len(rows)
+                vi = 0
+                for i in range(len(rows)):
+                    if i in oob_set:
+                        z_all[i] = None
+                    else:
+                        z_all[i] = valid_z[vi]
+                        vi += 1
 
     # Depending on the file format, when rasterio finds an invalid projection
     # of file, it might load it with a None crs, or it might throw an error.
@@ -181,9 +316,27 @@ def _get_elevation_for_single_dataset(
     """
 
     # Which paths we need results from.
-    lats = np.array(lats)
-    lons = np.array(lons)
-    paths = dataset.location_paths(lats, lons)
+    lats = np.array(lats, dtype=float)
+    lons = np.array(lons, dtype=float)
+
+    # Nudge coordinates that fall exactly on (or very near) integer tile
+    # boundaries.  Copernicus DEM pixel centres are offset from the integer
+    # degree grid by half a pixel (~0.000139°), so exact-integer coords land
+    # in a gap between adjacent tiles.  Nudging by _BOUNDARY_NUDGE (~55 m)
+    # pushes them into the tile interior – acceptable on a 30 m DEM.
+    _BOUNDARY_NUDGE = 0.0005
+    read_lats = lats.copy()
+    read_lons = lons.copy()
+    lat_frac = read_lats - np.floor(read_lats)
+    lon_frac = read_lons - np.floor(read_lons)
+    read_lats[lat_frac < _BOUNDARY_NUDGE] = (
+        np.floor(read_lats[lat_frac < _BOUNDARY_NUDGE]) + _BOUNDARY_NUDGE
+    )
+    read_lons[lon_frac < _BOUNDARY_NUDGE] = (
+        np.floor(read_lons[lon_frac < _BOUNDARY_NUDGE]) + _BOUNDARY_NUDGE
+    )
+
+    paths = dataset.location_paths(read_lats, read_lons)
 
     # Store mapping of tile path to point so we can merge back together later.
     elevations_by_path = {}
@@ -196,8 +349,8 @@ def _get_elevation_for_single_dataset(
         if path is None:
             elevations_by_path[None] = [None] * len(indices)
             continue
-        batch_lats = lats[path_to_point_index[path]]
-        batch_lons = lons[path_to_point_index[path]]
+        batch_lats = read_lats[path_to_point_index[path]]
+        batch_lons = read_lons[path_to_point_index[path]]
         elevations_by_path[path] = _get_elevation_from_path(
             batch_lats, batch_lons, path, interpolation
         )
@@ -207,6 +360,38 @@ def _get_elevation_for_single_dataset(
     for path, path_elevations in elevations_by_path.items():
         for i_path, i_original in enumerate(path_to_point_index[path]):
             elevations[i_original] = path_elevations[i_path]
+
+    # Fallback: for any remaining None results, try adjacent tiles.
+    # This covers edge cases where the nudge wasn't sufficient or the point
+    # lies in a different tile than the filename convention suggests.
+    none_indices = [i for i, e in enumerate(elevations) if e is None]
+    if none_indices and hasattr(dataset, "filename_tile_size"):
+        none_set = set(none_indices)
+        orig_paths = paths
+        for dlat, dlon in [(-1, 0), (0, -1), (-1, -1), (1, 0), (0, 1), (1, 1)]:
+            if not none_set:
+                break
+            retry_idx = sorted(none_set)
+            retry_lats = lats[retry_idx] + dlat
+            retry_lons = lons[retry_idx] + dlon
+            adj_paths = dataset.location_paths(retry_lats, retry_lons)
+
+            # Group by adjacent tile path, skip if same as original or missing.
+            adj_by_path = collections.defaultdict(list)
+            for j, (adj_p, ri) in enumerate(zip(adj_paths, retry_idx)):
+                if adj_p is not None and adj_p != orig_paths[ri]:
+                    adj_by_path[adj_p].append(ri)
+
+            for adj_path, indices in adj_by_path.items():
+                batch_lats = lats[indices]
+                batch_lons = lons[indices]
+                adj_elevs = _get_elevation_from_path(
+                    batch_lats, batch_lons, adj_path, interpolation
+                )
+                for k, idx in enumerate(indices):
+                    if adj_elevs[k] is not None:
+                        elevations[idx] = adj_elevs[k]
+                        none_set.discard(idx)
 
     elevations = utils.fill_na(elevations, nodata_value)
     return elevations
@@ -234,13 +419,13 @@ def get_elevation(lats, lons, datasets, interpolation="nearest", nodata_value=No
         elevations: List of elevations, same length as lats/lons.
     """
 
-    # # Early exit for single dataset.
-    # if len(datasets) == 1:
-    #     elevations = _get_elevation_for_single_dataset(
-    #         lats, lons, datasets[0], interpolation, nodata_value
-    #     )
-    #     dataset_names = [datasets[0].name] * len(lats)
-    #     return elevations, dataset_names
+    # Early exit for single dataset.
+    if len(datasets) == 1:
+        elevations = _get_elevation_for_single_dataset(
+            lats, lons, datasets[0], interpolation, nodata_value
+        )
+        dataset_names = [datasets[0].name] * len(lats)
+        return elevations, dataset_names
 
     # Check
     points = [_Point(lat, lon, idx) for idx, (lat, lon) in enumerate(zip(lats, lons))]
