@@ -316,9 +316,27 @@ def _get_elevation_for_single_dataset(
     """
 
     # Which paths we need results from.
-    lats = np.array(lats)
-    lons = np.array(lons)
-    paths = dataset.location_paths(lats, lons)
+    lats = np.array(lats, dtype=float)
+    lons = np.array(lons, dtype=float)
+
+    # Nudge coordinates that fall exactly on (or very near) integer tile
+    # boundaries.  Copernicus DEM pixel centres are offset from the integer
+    # degree grid by half a pixel (~0.000139°), so exact-integer coords land
+    # in a gap between adjacent tiles.  Nudging by _BOUNDARY_NUDGE (~55 m)
+    # pushes them into the tile interior – acceptable on a 30 m DEM.
+    _BOUNDARY_NUDGE = 0.0005
+    read_lats = lats.copy()
+    read_lons = lons.copy()
+    lat_frac = read_lats - np.floor(read_lats)
+    lon_frac = read_lons - np.floor(read_lons)
+    read_lats[lat_frac < _BOUNDARY_NUDGE] = (
+        np.floor(read_lats[lat_frac < _BOUNDARY_NUDGE]) + _BOUNDARY_NUDGE
+    )
+    read_lons[lon_frac < _BOUNDARY_NUDGE] = (
+        np.floor(read_lons[lon_frac < _BOUNDARY_NUDGE]) + _BOUNDARY_NUDGE
+    )
+
+    paths = dataset.location_paths(read_lats, read_lons)
 
     # Store mapping of tile path to point so we can merge back together later.
     elevations_by_path = {}
@@ -331,8 +349,8 @@ def _get_elevation_for_single_dataset(
         if path is None:
             elevations_by_path[None] = [None] * len(indices)
             continue
-        batch_lats = lats[path_to_point_index[path]]
-        batch_lons = lons[path_to_point_index[path]]
+        batch_lats = read_lats[path_to_point_index[path]]
+        batch_lons = read_lons[path_to_point_index[path]]
         elevations_by_path[path] = _get_elevation_from_path(
             batch_lats, batch_lons, path, interpolation
         )
@@ -342,6 +360,38 @@ def _get_elevation_for_single_dataset(
     for path, path_elevations in elevations_by_path.items():
         for i_path, i_original in enumerate(path_to_point_index[path]):
             elevations[i_original] = path_elevations[i_path]
+
+    # Fallback: for any remaining None results, try adjacent tiles.
+    # This covers edge cases where the nudge wasn't sufficient or the point
+    # lies in a different tile than the filename convention suggests.
+    none_indices = [i for i, e in enumerate(elevations) if e is None]
+    if none_indices and hasattr(dataset, "filename_tile_size"):
+        none_set = set(none_indices)
+        orig_paths = paths
+        for dlat, dlon in [(-1, 0), (0, -1), (-1, -1), (1, 0), (0, 1), (1, 1)]:
+            if not none_set:
+                break
+            retry_idx = sorted(none_set)
+            retry_lats = lats[retry_idx] + dlat
+            retry_lons = lons[retry_idx] + dlon
+            adj_paths = dataset.location_paths(retry_lats, retry_lons)
+
+            # Group by adjacent tile path, skip if same as original or missing.
+            adj_by_path = collections.defaultdict(list)
+            for j, (adj_p, ri) in enumerate(zip(adj_paths, retry_idx)):
+                if adj_p is not None and adj_p != orig_paths[ri]:
+                    adj_by_path[adj_p].append(ri)
+
+            for adj_path, indices in adj_by_path.items():
+                batch_lats = lats[indices]
+                batch_lons = lons[indices]
+                adj_elevs = _get_elevation_from_path(
+                    batch_lats, batch_lons, adj_path, interpolation
+                )
+                for k, idx in enumerate(indices):
+                    if adj_elevs[k] is not None:
+                        elevations[idx] = adj_elevs[k]
+                        none_set.discard(idx)
 
     elevations = utils.fill_na(elevations, nodata_value)
     return elevations
