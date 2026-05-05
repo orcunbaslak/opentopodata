@@ -25,6 +25,7 @@ Latitudes and longitudes should be in `EPSG:4326` (also known as WGS-84 format),
     * `NaN` (not a number) values aren't valid in json and will break some clients. The `nan` option was default before version 1.4 and is provided only for backwards compatibility. 
     * When querying multiple datasets, this NODATA replacement only applies to the last dataset in the stack.
 * `format`: Either `json` or `geojson`. Default: `json`.
+* `crs`: Optional. EPSG code (e.g. `EPSG:32633`) the `locations` are expressed in. When provided, `locations` is parsed as `x,y|x,y|...` pairs in that CRS instead of `lat,lon` in WGS84, and the response echoes the original projected coordinates so clients can avoid a WGS84 round-trip. Useful for clients working in UTM (or any other projected CRS) that would otherwise accumulate sub-metre rounding drift across `UTM → WGS84 → UTM` conversions. Mutually exclusive with polyline-encoded `locations` and the `samples` argument.
 
 
  
@@ -127,6 +128,44 @@ If `format=geojson` is passed, you get a `FeatureCollection` of `Point` geometri
 }
 ```
 
+
+### Projected-CRS example
+
+When `crs` is provided, `locations` carry projected `x,y` pairs (e.g. UTM
+easting/northing) and the response echoes them verbatim under
+`results[].location` instead of `lat`/`lng`:
+
+```
+POST /v1/srtm90m
+{
+  "locations": "669875,5219140|669900,5219140",
+  "crs": "EPSG:32633",
+  "interpolation": "bilinear"
+}
+```
+
+```json
+{
+  "results": [
+    {
+      "elevation": 1731,
+      "dataset": "srtm90m",
+      "location": {"x": 669875, "y": 5219140, "crs": "EPSG:32633"}
+    },
+    {
+      "elevation": 1731,
+      "dataset": "srtm90m",
+      "location": {"x": 669900, "y": 5219140, "crs": "EPSG:32633"}
+    }
+  ],
+  "status": "OK"
+}
+```
+
+For `format=geojson` with `crs`, the GeoJSON `geometry.coordinates` stay
+canonical WGS84 `[lon, lat, z]` (so the document remains a valid GeoJSON),
+and the projected coordinates appear under `properties` as `x`, `y`, and
+`crs`.
 
 
 ---

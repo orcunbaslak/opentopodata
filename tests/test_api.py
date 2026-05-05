@@ -212,6 +212,72 @@ class TestParseLocations:
         )
 
 
+class TestParseCRS:
+    def test_none_passthrough(self):
+        assert api._parse_crs(None) is None
+
+    def test_empty_passthrough(self):
+        assert api._parse_crs("") is None
+
+    def test_valid_utm_north(self):
+        crs = api._parse_crs("EPSG:32633")
+        assert crs is not None
+        assert crs.to_epsg() == 32633
+
+    def test_valid_utm_south(self):
+        crs = api._parse_crs("EPSG:32733")
+        assert crs is not None
+        assert crs.to_epsg() == 32733
+
+    def test_invalid_string_raises(self):
+        with pytest.raises(api.ClientError):
+            api._parse_crs("not a crs")
+
+    def test_unknown_epsg_raises(self):
+        with pytest.raises(api.ClientError):
+            api._parse_crs("EPSG:99999999")
+
+
+class TestParseXyLocations:
+    UTM33N = None  # populated lazily so a single CRS parse is shared
+
+    def _crs(self):
+        if self.UTM33N is None:
+            type(self).UTM33N = api._parse_crs("EPSG:32633")
+        return self.UTM33N
+
+    def test_empty_input_raises(self):
+        with pytest.raises(api.ClientError):
+            api._parse_xy_locations("", MAX_N_POINTS, self._crs())
+
+    def test_polyline_combination_raises(self):
+        # Polyline encoding has no commas — refuse explicitly.
+        with pytest.raises(api.ClientError):
+            api._parse_xy_locations("kzn_JmmvhAjdIelA", MAX_N_POINTS, self._crs())
+
+    def test_too_many_points_raises(self):
+        with pytest.raises(api.ClientError):
+            api._parse_xy_locations("100,100|200,200", 1, self._crs())
+
+    def test_non_numeric_raises(self):
+        with pytest.raises(api.ClientError):
+            api._parse_xy_locations("100,Test", MAX_N_POINTS, self._crs())
+
+    def test_valid_xys_reproject_and_echo(self):
+        # UTM 33N: easting 500000 = central meridian (15°E), northing 0 = equator.
+        lats, lons, xs, ys = api._parse_xy_locations(
+            "500000,0|500000,1000000", MAX_N_POINTS, self._crs()
+        )
+        # Original projected coords are echoed unchanged.
+        assert xs == [500000, 500000]
+        assert ys == [0, 1000000]
+        # Reprojected lats/lons are valid WGS84 numbers.
+        assert all(math.isfinite(v) for v in lats)
+        assert all(math.isfinite(v) for v in lons)
+        # Easting=500000 on the central meridian → lon ≈ 15°.
+        assert abs(lons[0] - 15.0) < 1e-6
+
+
 class TestGetDatasets:
     def test_valid_dataset(self, patch_config):
         with api.app.test_request_context():
@@ -512,6 +578,115 @@ class TestGetHealthStatus:
             rjson = response.json
             assert response.status_code == 500
             assert rjson["status"] == "SERVER_ERROR"
+
+
+class TestGetElevationWithCRS:
+    """End-to-end tests for the optional ?crs=EPSG:NNNN parameter that lets
+    clients send/receive coordinates in any projected CRS (Issue 2)."""
+
+    test_api = api.app.test_client()
+
+    def test_utm_north_matches_wgs84_query(self, patch_config):
+        # Sample a known land point in WGS84, then in UTM 33N for the same
+        # location, and confirm the elevation matches.
+        wgs_lat, wgs_lon = 47.0, 11.0
+        wgs_resp = self.test_api.get(
+            f"/v1/etopo1deg?locations={wgs_lat},{wgs_lon}&interpolation=nearest"
+        )
+        assert wgs_resp.status_code == 200
+        wgs_z = wgs_resp.json["results"][0]["elevation"]
+
+        # Reproject the same point to UTM 33N (EPSG:32633).
+        import pyproj
+
+        transformer = pyproj.transformer.Transformer.from_crs(
+            "EPSG:4326", "EPSG:32633", always_xy=True
+        )
+        x, y = transformer.transform(wgs_lon, wgs_lat)
+
+        utm_resp = self.test_api.get(
+            f"/v1/etopo1deg?locations={x},{y}&crs=EPSG:32633&interpolation=nearest"
+        )
+        assert utm_resp.status_code == 200
+        rjson = utm_resp.json
+        assert rjson["status"] == "OK"
+        assert len(rjson["results"]) == 1
+        # Elevation should match the WGS84 query (same pixel).
+        assert rjson["results"][0]["elevation"] == wgs_z
+        # Echo: x and y returned verbatim, with the CRS string.
+        assert rjson["results"][0]["location"]["x"] == x
+        assert rjson["results"][0]["location"]["y"] == y
+        assert rjson["results"][0]["location"]["crs"] == "EPSG:32633"
+        # And no lat/lng leakage in the projected response.
+        assert "lat" not in rjson["results"][0]["location"]
+        assert "lng" not in rjson["results"][0]["location"]
+
+    def test_utm_south_works(self, patch_config):
+        # Equator near the EPSG:32733 central meridian (15°E south of equator)
+        # — easting=500000, northing=10000000 maps to (lat≈0, lon=15).
+        url = (
+            "/v1/etopo1deg?locations=500000,10000000"
+            "&crs=EPSG:32733&interpolation=nearest"
+        )
+        response = self.test_api.get(url)
+        assert response.status_code == 200
+        rjson = response.json
+        assert rjson["status"] == "OK"
+        assert rjson["results"][0]["location"]["crs"] == "EPSG:32733"
+
+    def test_invalid_epsg_returns_400(self, patch_config):
+        url = "/v1/etopo1deg?locations=500000,5200000&crs=EPSG:99999999"
+        response = self.test_api.get(url)
+        assert response.status_code == 400
+        assert response.json["status"] == "INVALID_REQUEST"
+        assert "Invalid CRS" in response.json["error"]
+
+    def test_polyline_with_crs_returns_400(self, patch_config):
+        url = "/v1/etopo1deg?locations=kzn_JmmvhAjdIelA&crs=EPSG:32633"
+        response = self.test_api.get(url)
+        assert response.status_code == 400
+        assert response.json["status"] == "INVALID_REQUEST"
+
+    def test_samples_with_crs_returns_400(self, patch_config):
+        url = (
+            "/v1/etopo1deg?locations=500000,5200000|600000,5300000"
+            "&crs=EPSG:32633&samples=10"
+        )
+        response = self.test_api.get(url)
+        assert response.status_code == 400
+        assert response.json["status"] == "INVALID_REQUEST"
+        assert "samples" in response.json["error"].lower()
+
+    def test_legacy_response_shape_unchanged_without_crs(self, patch_config):
+        # Sanity: requests without `crs` keep the original location shape.
+        url = "/v1/etopo1deg?locations=47.0,11.0&interpolation=nearest"
+        response = self.test_api.get(url)
+        assert response.status_code == 200
+        loc = response.json["results"][0]["location"]
+        assert "lat" in loc
+        assert "lng" in loc
+        assert "x" not in loc
+        assert "y" not in loc
+        assert "crs" not in loc
+
+    def test_geojson_keeps_wgs84_geometry_with_crs(self, patch_config):
+        url = (
+            "/v1/etopo1deg?locations=500000,5200000"
+            "&crs=EPSG:32633&format=geojson&interpolation=nearest"
+        )
+        response = self.test_api.get(url)
+        assert response.status_code == 200
+        rjson = response.json
+        assert rjson["type"] == "FeatureCollection"
+        feature = rjson["features"][0]
+        # Geometry stays canonical WGS84 (lon, lat, z).
+        coords = feature["geometry"]["coordinates"]
+        assert -180 <= coords[0] <= 180  # lon
+        assert -90 <= coords[1] <= 90  # lat
+        # Properties carry the projected coordinates.
+        assert feature["properties"]["x"] == 500000
+        assert feature["properties"]["y"] == 5200000
+        assert feature["properties"]["crs"] == "EPSG:32633"
 
 
 class TestDatasetsEndpoint:

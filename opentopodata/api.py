@@ -1,9 +1,11 @@
 import logging
+import math
 import os
 
 from flask import Flask, jsonify, request, Response
 from flask_caching import Cache
 import polyline
+import pyproj
 
 from opentopodata import backend, config, utils
 
@@ -269,6 +271,99 @@ def _parse_nodata_value(nodata_value):
     raise ClientError(msg)
 
 
+def _parse_crs(crs_str):
+    """Parse and validate an optional CRS argument.
+
+    Args:
+        crs_str: String like "EPSG:32633", or None / empty when caller
+            wants the default WGS84 lat/lon contract.
+
+    Returns:
+        A pyproj.CRS object, or None when the caller did not pass a CRS.
+
+    Raises:
+        ClientError: If crs_str is non-empty but cannot be parsed.
+    """
+    if not crs_str:
+        return None
+    try:
+        return pyproj.CRS.from_user_input(crs_str)
+    except (pyproj.exceptions.CRSError, ValueError, TypeError):
+        msg = f"Invalid CRS '{crs_str}'."
+        msg += " Provide an EPSG code like 'EPSG:32633'."
+        raise ClientError(msg)
+
+
+def _parse_xy_locations(locations, max_n_locations, crs):
+    """Parse "x,y|x,y|..." pairs in the given CRS and reproject to WGS84.
+
+    Used when the caller passes ?crs=EPSG:NNNN so coordinates can travel
+    in their native projection (eliminating client-side round-trip drift).
+
+    Args:
+        locations: Location query string in "x,y|x,y|..." format.
+        max_n_locations: Max allowable number of locations.
+        crs: pyproj.CRS object the coordinates are expressed in.
+
+    Returns:
+        Tuple of (lats, lons, xs, ys). lats/lons are WGS84 floats from
+        the reprojection; xs/ys are the original input floats so the
+        response builder can echo them verbatim.
+
+    Raises:
+        ClientError: For polyline input, malformed pairs, too-many points,
+            failed reprojection, or coordinates outside the CRS area of use.
+    """
+    if not locations:
+        msg = "No locations provided."
+        msg += " Add locations in a query string: ?locations=x1,y1|x2,y2."
+        raise ClientError(msg)
+
+    # Polyline encoding is WGS84-only; refuse the combination explicitly.
+    if "," not in locations:
+        msg = "Polyline-encoded locations are WGS84-only;"
+        msg += " do not pass 'crs' alongside polyline."
+        raise ClientError(msg)
+
+    raw_locations = locations.strip("|").split("|")
+    n_locations = len(raw_locations)
+    if n_locations > max_n_locations:
+        msg = f"Too many locations provided ({n_locations}), the limit is {max_n_locations}."
+        raise ClientError(msg)
+
+    xs = []
+    ys = []
+    for i, loc in enumerate(raw_locations):
+        if "," not in loc:
+            msg = f"Unable to parse location '{loc}' in position {i+1}."
+            msg += " Add locations like x1,y1|x2,y2."
+            raise ClientError(msg)
+        parts = loc.split(",", 1)
+        try:
+            x = float(parts[0])
+            y = float(parts[1])
+        except ValueError:
+            msg = f"Unable to parse location '{loc}' in position {i+1}."
+            raise ClientError(msg)
+        xs.append(x)
+        ys.append(y)
+
+    # Reproject to WGS84 for the elevation lookup.
+    try:
+        lats, lons = utils.reproject_xys_to_wgs84(xs, ys, crs)
+    except Exception as e:
+        msg = f"Failed to reproject locations from {crs.to_string()} to WGS84: {e}"
+        raise ClientError(msg)
+
+    # pyproj returns inf for points outside the CRS area of use.
+    for i, (lat, lon) in enumerate(zip(lats, lons)):
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            msg = f"Location {i+1} (x={xs[i]}, y={ys[i]}) is outside the area of use for {crs.to_string()}."
+            raise ClientError(msg)
+
+    return list(lats), list(lons), xs, ys
+
+
 def _parse_locations(locations, max_n_locations):
     """Parse and validate the locations GET argument.
 
@@ -530,10 +625,22 @@ def get_elevation(dataset_name):
         nodata_value = _parse_nodata_value(
             _find_request_argument(request, "nodata_value")
         )
-        lats, lons = _parse_locations(
-            _find_request_argument(request, "locations"),
-            _load_config()["max_locations_per_request"],
-        )
+
+        # Optional CRS lets clients pass coordinates in any EPSG-coded
+        # projection (e.g. UTM) and avoid a client-side WGS84 round-trip.
+        crs = _parse_crs(_find_request_argument(request, "crs"))
+        locations_arg = _find_request_argument(request, "locations")
+        max_locations = _load_config()["max_locations_per_request"]
+        if crs is None:
+            lats, lons = _parse_locations(locations_arg, max_locations)
+            xs = ys = None
+            crs_str = None
+        else:
+            lats, lons, xs, ys = _parse_xy_locations(
+                locations_arg, max_locations, crs
+            )
+            crs_str = crs.to_string()
+
         format = _parse_format(_find_request_argument(request, "format"))
 
         # Check if need to do sampling.
@@ -542,6 +649,11 @@ def get_elevation(dataset_name):
             _load_config()["max_locations_per_request"],
         )
         if n_samples:
+            if crs is not None:
+                # Sampling resamples the WGS84 path; we'd lose the 1:1
+                # mapping back to the original projected coordinates.
+                msg = "Path sampling ('samples') is not supported with 'crs'."
+                raise ClientError(msg)
             lats, lons = utils.sample_points_on_path(lats, lons, n_samples)
 
         # Get the z values.
@@ -555,25 +667,62 @@ def get_elevation(dataset_name):
 
         # Convert to json or geojson format.
         if format == "geojson":
-            for z, dataset_name, lat, lon in zip(elevations, dataset_names, lats, lons):
-                results.append(
-                    {
-                        "type": "Feature",
-                        "geometry": {"type": "Point", "coordinates": [lon, lat, z]},
-                        "properties": {"dataset": dataset_name},
-                    },
-                )
+            if crs is None:
+                for z, dataset_name, lat, lon in zip(
+                    elevations, dataset_names, lats, lons
+                ):
+                    results.append(
+                        {
+                            "type": "Feature",
+                            "geometry": {"type": "Point", "coordinates": [lon, lat, z]},
+                            "properties": {"dataset": dataset_name},
+                        },
+                    )
+            else:
+                # GeoJSON geometry stays canonical WGS84; the projected
+                # coordinates the client sent are echoed in `properties`.
+                for z, dataset_name, lat, lon, x, y in zip(
+                    elevations, dataset_names, lats, lons, xs, ys
+                ):
+                    results.append(
+                        {
+                            "type": "Feature",
+                            "geometry": {"type": "Point", "coordinates": [lon, lat, z]},
+                            "properties": {
+                                "dataset": dataset_name,
+                                "x": x,
+                                "y": y,
+                                "crs": crs_str,
+                            },
+                        },
+                    )
             data = {"type": "FeatureCollection", "features": results}
 
         else:
-            for z, dataset_name, lat, lon in zip(elevations, dataset_names, lats, lons):
-                results.append(
-                    {
-                        "elevation": z,
-                        "dataset": dataset_name,
-                        "location": {"lat": lat, "lng": lon},
-                    }
-                )
+            if crs is None:
+                for z, dataset_name, lat, lon in zip(
+                    elevations, dataset_names, lats, lons
+                ):
+                    results.append(
+                        {
+                            "elevation": z,
+                            "dataset": dataset_name,
+                            "location": {"lat": lat, "lng": lon},
+                        }
+                    )
+            else:
+                # Echo the projected coordinates the client sent verbatim
+                # — no round-trip transformation back through WGS84.
+                for z, dataset_name, x, y in zip(
+                    elevations, dataset_names, xs, ys
+                ):
+                    results.append(
+                        {
+                            "elevation": z,
+                            "dataset": dataset_name,
+                            "location": {"x": x, "y": y, "crs": crs_str},
+                        }
+                    )
             data = {"status": "OK", "results": results}
         return jsonify(data)
 

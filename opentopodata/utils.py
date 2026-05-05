@@ -52,6 +52,40 @@ def reproject_latlons(lats, lons, epsg=None, wkt=None):
     return x, y
 
 
+def reproject_xys_to_wgs84(xs, ys, from_crs):
+    """Convert projected (x, y) coordinates back to WGS84 lat/lon.
+
+    Inverse direction of `reproject_latlons`: takes coordinates expressed
+    in an arbitrary CRS (e.g. a UTM zone) and returns WGS84 lat/lon. Used
+    when the API receives `?crs=EPSG:NNNN` so the elevation lookup can
+    proceed in WGS84 against the underlying datasets.
+
+    Args:
+        xs, ys: Lists/arrays of x/y coordinates in `from_crs`.
+        from_crs: pyproj.CRS object or any string accepted by
+            pyproj.CRS.from_user_input (e.g. "EPSG:32633").
+
+    Returns:
+        (lats, lons): Tuple of lists in WGS84.
+    """
+    # Cache key is namespaced separately from reproject_latlons() so the
+    # two directions don't collide on the same _TRANSFORMER_CACHE.
+    crs_key = from_crs.to_string() if hasattr(from_crs, "to_string") else str(from_crs)
+    cache_key = ("from_crs", crs_key)
+    if cache_key in _TRANSFORMER_CACHE:
+        transformer = _TRANSFORMER_CACHE[cache_key]
+    else:
+        to_crs = f"EPSG:{WGS84_LATLON_EPSG}"
+        transformer = pyproj.transformer.Transformer.from_crs(
+            from_crs, to_crs, always_xy=True
+        )
+        _TRANSFORMER_CACHE[cache_key] = transformer
+
+    # always_xy=True means input is (x, y) and output is (lon, lat).
+    lons, lats = transformer.transform(xs, ys)
+    return lats, lons
+
+
 def base_floor(x, base=1):
     """Round number down to nearest multiple of base."""
     return base * np.floor(x / base)
