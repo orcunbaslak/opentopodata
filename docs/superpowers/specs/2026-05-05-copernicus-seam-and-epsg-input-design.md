@@ -73,26 +73,31 @@ Two distinct issues are currently being worked around in the C# client
 
 ### Issue 1 — three options
 
-- **A. Override nodata on file open** *(recommended)* — In
-  `_RasterioLRU.open()`, call `f.nodata = -32767` immediately after
-  `rasterio.open(path)` if the file declares no nodata. Single point of
-  control; both `f.sample()` and boundless reads benefit. Trade-off: relies
-  on a documented Copernicus value (`-32767` per the
-  [STEP forum thread](https://forum.step.esa.int/t/error-in-copernicus-dem-model-descriptor/36521)).
-  Must NOT use `0` here — see rasterio
-  [#3245](https://github.com/rasterio/rasterio/issues/3245) — it would mask
-  real sea-level pixels.
-- **B. Pass `boundless_fill_value=np.nan` on each read** — More invasive: needs
-  separate logic for `f.sample()` (which has no equivalent kwarg) and
-  `f.read()`. Avoids global handle state mutation but doubles the surface
-  area of the fix.
+- **A. Override nodata on file open** — Call `f.nodata = -32767` after
+  `rasterio.open(path)`. **Rejected** during implementation: rasterio's
+  `dataset.nodata` setter only works on files opened in `r+` mode, which
+  would mutate tiles on disk. Read-only opens (which is what we want) raise
+  `DatasetAttributeError: read-only attribute`.
+- **B. Pass `fill_value=np.nan` on the boundless read, only when the
+  dataset declares no nodata** *(recommended, implemented)* — In
+  `_get_elevation_from_path`, conditionally add `fill_value=np.nan` to the
+  `f.read(boundless=True, masked=True, ...)` call. Only the seam padding
+  becomes NaN; the in-tile masked array stays correct. The conditional is
+  load-bearing: passing `fill_value` together with `boundless=True` on a
+  dataset that *does* declare nodata suppresses rasterio's in-tile
+  masking, which would corrupt every existing nodata-aware dataset.
+  Verified empirically on `tests/data/datasets/test-nodata/nodata.geotiff`.
 - **C. Build-time tile buffering** — Physically buffer each tile by 1 pixel
   from neighbours offline (per upstream's
   [buffering-tiles note](https://github.com/ajnisbet/opentopodata/blob/master/docs/notes/buffering-tiles.md)).
   Heaviest option; requires re-processing 549 GiB of tiles.
 
-**Decision:** A. ~5 lines in one place, deterministic, uses the documented
-nodata value, restores the masking guarantee both sample paths rely on.
+**Decision:** B. Targeted at the failure mode (`nodata=None` + boundless
+padding leaking 0), no on-disk mutation, no effect on datasets that
+already declare nodata. The `f.sample()` nearest path is untouched — its
+internal-void edge case (Copernicus gap-fill regions where the source DEM
+itself wrote 0 instead of -32767) is rare and explicitly out of scope for
+this PR.
 
 ### Issue 2 — three options
 
@@ -135,14 +140,18 @@ calls without `crs` keep their contract byte-identical.
                     ┌───────────────────────────────────────────────┐
                     │  backend.py — elevation read layer            │
                     │                                               │
-                    │   _RasterioLRU.open(path)         (PATCH)     │
-                    │       └─► f = rasterio.open(path)             │
-                    │           if f.nodata is None:                │
-                    │               f.nodata = -32767               │
+                    │   _RasterioLRU.open(path)         (UNCHANGED) │
                     │                                               │
-                    │   _get_elevation_from_path(...)   (UNCHANGED) │
-                    │       f.sample(...) / f.read(...)             │
-                    │       — now correctly masks seam pixels       │
+                    │   _get_elevation_from_path(...)   (PATCH)     │
+                    │       f.sample(...)               (untouched) │
+                    │       f.read(boundless=True, masked=True,     │
+                    │              **( {"fill_value": np.nan}       │
+                    │                   if f.nodata is None         │
+                    │                   else {} ))                  │
+                    │       — boundless seam padding becomes NaN    │
+                    │         only when the dataset declares no     │
+                    │         nodata (Copernicus); declared-nodata  │
+                    │         datasets keep their existing masking  │
                     └───────────────────────────────────────────────┘
 ```
 
@@ -150,25 +159,29 @@ calls without `crs` keep their contract byte-identical.
 
 #### Issue 1 — `backend.py` patch
 
-In `_RasterioLRU.open()`, after `f = rasterio.open(path)` and **before** the
-handle is inserted into the LRU cache (i.e. while still outside the lock, on
-the same thread that opened it). Setting nodata before any other thread can
-observe the cached handle keeps the override race-free without holding the
-lock during the rasterio call.
+In `_get_elevation_from_path`, conditionally add `fill_value=np.nan` to
+the bilinear/cubic boundless read when (and only when) the dataset
+declares no nodata:
 
 ```python
-f = rasterio.open(path)
-# Copernicus GLO-30 COGs ship with nodata=None, which causes boundless reads
-# and f.sample() to silently return 0 for out-of-tile pixels (rasterio #2916).
-# -32767 is Copernicus's documented nodata; do NOT use 0 (rasterio #3245
-# would then mask real sea-level pixels).
+read_kwargs = dict(
+    indexes=1, window=window, out_dtype=float,
+    boundless=True, masked=True,
+)
 if f.nodata is None:
-    f.nodata = -32767
-with self._lock:
-    ...  # existing cache insertion logic
+    # rasterio #2916: Copernicus COGs ship with nodata=None and
+    # boundless reads silently fill out-of-tile pixels with 0,
+    # contaminating bilinear/cubic kernels at integer-degree seams.
+    # Setting fill_value=np.nan only when no nodata is declared
+    # avoids breaking the in-tile masking on datasets that *do*
+    # declare nodata (rasterio suppresses that masking when both
+    # boundless=True and fill_value are passed).
+    read_kwargs["fill_value"] = np.nan
+data = f.read(**read_kwargs)
 ```
 
-That is the entire production-code change for Issue 1.
+That is the entire production-code change for Issue 1. The
+`f.sample()` nearest path is left untouched.
 
 #### Issue 2 — `api.py` extensions
 
@@ -218,8 +231,10 @@ api.py: _parse_locations(...)                  → lats=[47.123, 47.123],
            │
            ▼
 backend.get_elevation(lats, lons, …)           → elevations=[1731.0, 1731.4]
-   └─ _RasterioLRU.open(N47E011.tif)
-        with nodata = -32767 (Issue 1 fix)     → seam pixels mask correctly
+   └─ _get_elevation_from_path(...)
+        f.read(boundless=True, masked=True,
+               fill_value=np.nan)              → seam padding becomes NaN
+        (Issue 1 fix — only when f.nodata is None)
            │
            ▼
 api.py response build (crs branch):
@@ -350,7 +365,7 @@ from an existing test tile and committed under
 ## Files touched
 
 ```
-opentopodata/backend.py               (+5 lines  — Issue 1)
+opentopodata/backend.py               (+~15 lines — Issue 1)
 opentopodata/api.py                   (+~80 lines — Issue 2)
 docs/api.md                           (~+30 lines — `crs` parameter docs)
 tests/test_backend.py                 (+~40 lines — Issue 1 regression)
@@ -367,7 +382,7 @@ configs, `CLAUDE.md`.
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| `f.nodata = -32767` masks legitimate `-32767` pixels in non-Copernicus datasets that also lack nodata | Low | The override only applies when `f.nodata is None`. Datasets that explicitly declare `nodata` are unaffected. Document the behaviour in `CLAUDE.md`. |
+| `fill_value=np.nan` breaks in-tile masking when added unconditionally | Confirmed during impl | Conditional on `f.nodata is None`. Verified via the existing nodata-aware test fixture: in-tile mask remains correct, only the boundless padding becomes NaN. |
 | pyproj transformer init for an unfamiliar EPSG code is slow on first use | Low | Already cached via `_TRANSFORMER_CACHE`. First-call cost ~5-20 ms; subsequent calls sub-ms. |
 | Client passes `crs` with polyline locations | Low | Validated explicitly with a 400 response. |
 | Existing WGS84 callers see any behavioural change | Negligible | The `crs is None` branch is byte-identical to the current code; existing tests must continue to pass without modification. |
