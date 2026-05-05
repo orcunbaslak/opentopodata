@@ -298,6 +298,59 @@ def _get_elevation_from_path(lats, lons, path, interpolation):
     return z_all
 
 
+_BOUNDARY_NUDGE = 0.0005
+
+
+def _apply_boundary_nudge(lats, lons, nudge=_BOUNDARY_NUDGE):
+    """Push coordinates near an integer-degree tile boundary into the
+    tile interior.
+
+    Copernicus DEM pixel centres sit half a pixel (~0.000139°) inside the
+    integer-degree extent reported by GDAL, so:
+
+      - exact-integer coordinates (e.g. lat=47.0) land in the half-pixel
+        gap between adjacent tiles and bounds-validation rejects them;
+      - coordinates within ~one pixel of the opposite edge (e.g.
+        lat=47.9999 against an N47 tile whose north pixel-centre extent
+        ends at 47.999861) sit in the same half-pixel sliver above the
+        pixel-centre extent and are also rejected.
+
+    Both cases produce null elevations along integer-degree seams, which
+    in turn manifest as vertical 0-strips on the client side. The nudge
+    is symmetric: west/south near-zero fractions step forward into the
+    tile *above* the integer; east/north near-one fractions step
+    backward to keep the bilinear/cubic interpolation kernel inside the
+    tile that owns the point.
+
+    Refs: pvxai/pvx#785; opentopodata #24.
+
+    Args:
+        lats, lons: 1-D float arrays of latitude/longitude.
+        nudge: Distance (degrees) by which an integer-near coordinate is
+            pushed into the tile. ~0.0005° = 1.8 px on a 30 m DEM.
+
+    Returns:
+        (nudged_lats, nudged_lons): Copies of the inputs with near-edge
+        coordinates pushed into the tile interior.
+    """
+    read_lats = lats.copy()
+    read_lons = lons.copy()
+    lat_frac = read_lats - np.floor(read_lats)
+    lon_frac = read_lons - np.floor(read_lons)
+
+    low_lat = lat_frac < nudge
+    high_lat = lat_frac > 1 - nudge
+    low_lon = lon_frac < nudge
+    high_lon = lon_frac > 1 - nudge
+
+    read_lats[low_lat] = np.floor(read_lats[low_lat]) + nudge
+    read_lats[high_lat] = np.floor(read_lats[high_lat]) + (1 - nudge)
+    read_lons[low_lon] = np.floor(read_lons[low_lon]) + nudge
+    read_lons[high_lon] = np.floor(read_lons[high_lon]) + (1 - nudge)
+
+    return read_lats, read_lons
+
+
 def _get_elevation_for_single_dataset(
     lats, lons, dataset, interpolation="nearest", nodata_value=None
 ):
@@ -319,22 +372,10 @@ def _get_elevation_for_single_dataset(
     lats = np.array(lats, dtype=float)
     lons = np.array(lons, dtype=float)
 
-    # Nudge coordinates that fall exactly on (or very near) integer tile
-    # boundaries.  Copernicus DEM pixel centres are offset from the integer
-    # degree grid by half a pixel (~0.000139°), so exact-integer coords land
-    # in a gap between adjacent tiles.  Nudging by _BOUNDARY_NUDGE (~55 m)
-    # pushes them into the tile interior – acceptable on a 30 m DEM.
-    _BOUNDARY_NUDGE = 0.0005
-    read_lats = lats.copy()
-    read_lons = lons.copy()
-    lat_frac = read_lats - np.floor(read_lats)
-    lon_frac = read_lons - np.floor(read_lons)
-    read_lats[lat_frac < _BOUNDARY_NUDGE] = (
-        np.floor(read_lats[lat_frac < _BOUNDARY_NUDGE]) + _BOUNDARY_NUDGE
-    )
-    read_lons[lon_frac < _BOUNDARY_NUDGE] = (
-        np.floor(read_lons[lon_frac < _BOUNDARY_NUDGE]) + _BOUNDARY_NUDGE
-    )
+    # Nudge coordinates that fall within ~one pixel of either side of an
+    # integer-degree tile boundary into the tile interior. See the
+    # _apply_boundary_nudge docstring for the rationale.
+    read_lats, read_lons = _apply_boundary_nudge(lats, lons)
 
     paths = dataset.location_paths(read_lats, read_lons)
 
