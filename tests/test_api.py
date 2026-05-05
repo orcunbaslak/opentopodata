@@ -239,34 +239,31 @@ class TestParseCRS:
 
 
 class TestParseXyLocations:
-    UTM33N = None  # populated lazily so a single CRS parse is shared
+    @pytest.fixture
+    def utm33n(self):
+        return api._parse_crs("EPSG:32633")
 
-    def _crs(self):
-        if self.UTM33N is None:
-            type(self).UTM33N = api._parse_crs("EPSG:32633")
-        return self.UTM33N
-
-    def test_empty_input_raises(self):
+    def test_empty_input_raises(self, utm33n):
         with pytest.raises(api.ClientError):
-            api._parse_xy_locations("", MAX_N_POINTS, self._crs())
+            api._parse_xy_locations("", MAX_N_POINTS, utm33n)
 
-    def test_polyline_combination_raises(self):
+    def test_polyline_combination_raises(self, utm33n):
         # Polyline encoding has no commas — refuse explicitly.
         with pytest.raises(api.ClientError):
-            api._parse_xy_locations("kzn_JmmvhAjdIelA", MAX_N_POINTS, self._crs())
+            api._parse_xy_locations("kzn_JmmvhAjdIelA", MAX_N_POINTS, utm33n)
 
-    def test_too_many_points_raises(self):
+    def test_too_many_points_raises(self, utm33n):
         with pytest.raises(api.ClientError):
-            api._parse_xy_locations("100,100|200,200", 1, self._crs())
+            api._parse_xy_locations("100,100|200,200", 1, utm33n)
 
-    def test_non_numeric_raises(self):
+    def test_non_numeric_raises(self, utm33n):
         with pytest.raises(api.ClientError):
-            api._parse_xy_locations("100,Test", MAX_N_POINTS, self._crs())
+            api._parse_xy_locations("100,Test", MAX_N_POINTS, utm33n)
 
-    def test_valid_xys_reproject_and_echo(self):
+    def test_valid_xys_reproject_and_echo(self, utm33n):
         # UTM 33N: easting 500000 = central meridian (15°E), northing 0 = equator.
         lats, lons, xs, ys = api._parse_xy_locations(
-            "500000,0|500000,1000000", MAX_N_POINTS, self._crs()
+            "500000,0|500000,1000000", MAX_N_POINTS, utm33n
         )
         # Original projected coords are echoed unchanged.
         assert xs == [500000, 500000]

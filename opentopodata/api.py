@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import re
 
 from flask import Flask, jsonify, request, Response
 from flask_caching import Cache
@@ -8,6 +9,9 @@ import polyline
 import pyproj
 
 from opentopodata import backend, config, utils
+
+
+_EPSG_RE = re.compile(r"^EPSG:(\d+)$")
 
 
 app = Flask(__name__)
@@ -274,6 +278,10 @@ def _parse_nodata_value(nodata_value):
 def _parse_crs(crs_str):
     """Parse and validate an optional CRS argument.
 
+    Restricted to ``EPSG:<digits>`` strings rather than arbitrary
+    ``pyproj.CRS.from_user_input`` to keep the contract narrow and avoid
+    handing user input straight to a WKT/PROJ parser.
+
     Args:
         crs_str: String like "EPSG:32633", or None / empty when caller
             wants the default WGS84 lat/lon contract.
@@ -282,15 +290,18 @@ def _parse_crs(crs_str):
         A pyproj.CRS object, or None when the caller did not pass a CRS.
 
     Raises:
-        ClientError: If crs_str is non-empty but cannot be parsed.
+        ClientError: If crs_str is non-empty but doesn't match
+            ``^EPSG:\\d+$`` or the EPSG code is unknown.
     """
     if not crs_str:
         return None
+    msg = f"Invalid CRS '{crs_str}'. Provide an EPSG code like 'EPSG:32633'."
+    m = _EPSG_RE.match(crs_str)
+    if not m:
+        raise ClientError(msg)
     try:
-        return pyproj.CRS.from_user_input(crs_str)
-    except (pyproj.exceptions.CRSError, ValueError, TypeError):
-        msg = f"Invalid CRS '{crs_str}'."
-        msg += " Provide an EPSG code like 'EPSG:32633'."
+        return pyproj.CRS.from_epsg(int(m.group(1)))
+    except (pyproj.exceptions.CRSError, ValueError):
         raise ClientError(msg)
 
 
@@ -320,7 +331,10 @@ def _parse_xy_locations(locations, max_n_locations, crs):
         raise ClientError(msg)
 
     # Polyline encoding is WGS84-only; refuse the combination explicitly.
-    if "," not in locations:
+    # A polyline has no commas and no pipes — anything else with a missing
+    # comma is just a malformed pair, which falls through to the per-location
+    # parser below for a more accurate diagnostic.
+    if "," not in locations and "|" not in locations:
         msg = "Polyline-encoded locations are WGS84-only;"
         msg += " do not pass 'crs' alongside polyline."
         raise ClientError(msg)
