@@ -263,7 +263,26 @@ def _get_elevation_from_path(lats, lons, path, interpolation):
                 c_max = min(int(np.ceil(fcols.max())) + pad + 1, f.width)
 
                 window = rasterio.windows.Window(c_min, r_min, c_max - c_min, r_max - r_min)
-                data = f.read(indexes=1, window=window, out_dtype=float, boundless=True, masked=True)
+                # Copernicus GLO-30 COGs ship with nodata=None, which makes
+                # boundless reads silently fill out-of-tile pixels with 0
+                # (rasterio #2916); those zeros then drag bilinear/cubic
+                # kernels toward 0 along integer-degree tile seams. Setting
+                # fill_value=NaN turns the seam padding into NaN instead.
+                # We only set it when the dataset declares no nodata:
+                # passing fill_value alongside boundless=True suppresses
+                # the in-tile masking rasterio would otherwise apply for
+                # datasets that *do* declare nodata, so we leave that path
+                # untouched.
+                read_kwargs = dict(
+                    indexes=1,
+                    window=window,
+                    out_dtype=float,
+                    boundless=True,
+                    masked=True,
+                )
+                if f.nodata is None:
+                    read_kwargs["fill_value"] = np.nan
+                data = f.read(**read_kwargs)
                 data = np.ma.filled(data, np.nan)
 
                 # Coordinates relative to the window origin.

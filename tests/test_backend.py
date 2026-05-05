@@ -348,3 +348,77 @@ class TestGetElevation:
         assert all(z)
         assert all(np.isfinite(z))
         assert names == [SRTM_DATASET_NAME] * len(lats)
+
+
+class TestBoundlessReadFillValue:
+    """Issue 1 regression: Copernicus GLO-30 COGs ship with nodata=None.
+    Without fill_value=np.nan, a boundless read past the tile extent
+    silently returns 0 for the padded pixels (rasterio #2916), and those
+    zeros then drag bilinear/cubic interpolation kernels toward 0 along
+    integer-degree tile seams. _get_elevation_from_path now passes
+    fill_value=np.nan so seam padding becomes NaN instead."""
+
+    @staticmethod
+    def _write_tif(path, data, nodata=None):
+        height, width = data.shape
+        transform = rasterio.transform.from_bounds(
+            west=0, south=0, east=1, north=1, width=width, height=height
+        )
+        kwargs = dict(
+            driver="GTiff",
+            width=width,
+            height=height,
+            count=1,
+            dtype=data.dtype,
+            crs="EPSG:4326",
+            transform=transform,
+        )
+        if nodata is not None:
+            kwargs["nodata"] = nodata
+        with rasterio.open(path, "w", **kwargs) as dst:
+            dst.write(data, 1)
+
+    def test_seam_padding_is_nan_not_zero(self, tmp_path):
+        # 4x4 tile with nodata=None. Read a 5x5 window starting one row
+        # and column outside the extent; the surrounding ring is the
+        # boundless padding that used to leak as 0.
+        path = str(tmp_path / "no_nodata.tif")
+        data = np.full((4, 4), 1500, dtype=np.int16)
+        self._write_tif(path, data, nodata=None)
+
+        # Sanity: the on-disk file has no nodata declared.
+        with rasterio.open(path) as raw:
+            assert raw.nodata is None
+
+        lru = backend._RasterioLRU(maxsize=4)
+        f = lru.open(path)
+
+        window = rasterio.windows.Window(-1, -1, 6, 6)
+        arr = f.read(
+            1,
+            window=window,
+            boundless=True,
+            masked=True,
+            out_dtype=float,
+            fill_value=np.nan,
+        )
+        arr = np.ma.filled(arr, np.nan)
+
+        # Centre 4x4 is the real data.
+        assert (arr[1:5, 1:5] == 1500).all()
+        # Outer ring is boundless padding — must be NaN, not 0.
+        assert np.isnan(arr[0, :]).all()
+        assert np.isnan(arr[5, :]).all()
+        assert np.isnan(arr[:, 0]).all()
+        assert np.isnan(arr[:, 5]).all()
+
+    def test_inside_tile_bilinear_unchanged(self, tmp_path):
+        # End-to-end via _get_elevation_from_path: a point well inside
+        # the tile must still return the clean elevation, i.e. the
+        # fill_value=np.nan kwarg has not perturbed in-tile reads.
+        path = str(tmp_path / "no_nodata_inside.tif")
+        data = np.full((4, 4), 1500, dtype=np.int16)
+        self._write_tif(path, data, nodata=None)
+
+        z = backend._get_elevation_from_path([0.5], [0.5], path, "bilinear")
+        assert z[0] == 1500
