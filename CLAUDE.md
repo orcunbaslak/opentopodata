@@ -10,6 +10,15 @@ Fork of [ajnisbet/opentopodata](https://github.com/ajnisbet/opentopodata) — a 
 - **Data**: /var/opentopodata/data/copernicus30m/ (26,450 tiles, ~549 GiB)
 - **Config**: /var/opentopodata/config.yaml
 
+## Git Remote Policy
+
+**Always work against `fork` (orcunbaslak/opentopodata). Never push, open PRs, or target `origin` (ajnisbet/opentopodata) — that's upstream.**
+
+- Push: `git push fork <branch>` (never plain `git push`, which defaults to `origin`)
+- PRs: `gh pr create --repo orcunbaslak/opentopodata ...`
+- PR ops (merge/view/checkout): pass `--repo orcunbaslak/opentopodata`
+- Fetch from upstream is fine (`git fetch origin`) — just don't push or PR there
+
 ## Build & Test Commands
 
 ```bash
@@ -172,6 +181,87 @@ curl "http://localhost:5000/v1/copernicus30m?locations=47.0,11.0&interpolation=n
 - Tiles are already Cloud Optimized GeoTIFF with DEFLATE compression — no recompression needed
 - Each tile is 3600x3600 pixels covering 1°×1°
 - Pixel centers are offset from integer degree boundaries by half a pixel (~0.000139°), which is why the boundary nudge logic exists in backend.py
+
+## Filling Coverage Gaps (DGED 2023_1 from OpenTopography)
+
+The AWS public bucket (`s3://copernicus-dem-30m`) hosts the **2021 GLO-30 Public release**, which **omits ~125 tiles** over politically-restricted or coverage-deferred regions (Caucasus / Armenia / Azerbaijan / Nakhchivan, eastern Egypt + Sinai, Yemen, Saudi Arabia, Oman east coast, Morocco western Sahara, Black Sea coast, etc.). The API returns `null` for those tiles.
+
+ESA released **DGED 2023_1** in July 2024 with these gaps filled. **OpenTopography mirrors the full DGED 2023_1** at the same pixel registration as the AWS tiles (3600×3600 Float32, half-pixel offset, 1 arc-second). Bit-exact for tiles present in both sources.
+
+### 1. Get OpenTopography API keys
+
+Register a free account at https://portal.opentopography.org/myopentopo (1 min). Each key has a quota of **50 requests / 24 h**. To download all 125 gap tiles in a single sitting, register **3 separate accounts** (different emails) and rotate the keys.
+
+Save keys to `/opt/opentopodata/.opentopography_keys` (already gitignored). One per line.
+
+### 2. Compile the list of missing tiles
+
+The original gap list (from a friend's land-coverage classifier) lives in `/tmp/topo_verify/download_high.sh` — 116 HIGH-priority tiles spanning Morocco, Egypt/Sinai/Levant, Yemen, Black Sea / Caucasus border, Saudi/Oman, Türkiye Anatolia. Plus 9 extra tiles for Armenia/Azerbaijan core (N39E045..N39E048, N40E044..N40E048) that the classifier missed because they sit in a cluster with no neighboring "present" tiles to compare against.
+
+When auditing a new region, walk the bbox tile-by-tile against the AWS bucket directly rather than relying on neighbor heuristics:
+
+```bash
+for t in N{38..42}E{043..050}; do
+  key="Copernicus_DSM_COG_10_${t:0:3}_00_${t:3:4}_00_DEM"
+  aws s3api head-object --bucket copernicus-dem-30m \
+    --key "${key}/${key}.tif" --no-sign-request >/dev/null 2>&1 \
+    || echo "$t MISSING (gap)"
+done
+```
+
+### 3. Download each missing tile
+
+OpenTopography returns a single GeoTIFF per bbox request (LZW compression; rasterio reads both LZW and AWS-bucket DEFLATE transparently):
+
+```bash
+KEY="<your-opentopography-key>"
+DATA_DIR="/var/opentopodata/data/copernicus30m"
+TILE="N39E045"   # → south=39 north=40 west=45 east=46
+
+curl -s -o "$DATA_DIR/$TILE.tif" \
+  "https://portal.opentopography.org/API/globaldem?demtype=COP30&south=39&north=40&west=45&east=46&outputFormat=GTiff&API_Key=$KEY"
+
+# Validate it's a real TIFF (quota errors come back as HTTP 401 with XML body)
+head -c 4 "$DATA_DIR/$TILE.tif" | xxd -p
+# expect: 49492a00 (little-endian TIFF) or 4d4d002a (big-endian)
+```
+
+Quota-exhausted response (HTTP 401, file is XML, not TIFF):
+```
+<error>Error: API maximum rate limit reached. (50 API calls/24hrs)</error>
+```
+
+A parallel fetcher with skip-if-exists logic + magic-byte validation is at `/tmp/topo_verify/download_high.sh`. Run it once per key (~50 tiles per 24 h window).
+
+### 4. Restart the container
+
+The dataset's `_tile_lookup` is built at process start, so newly-added tiles aren't visible until restart:
+
+```bash
+cd /opt/opentopodata
+docker compose restart
+```
+
+### 5. Verify
+
+Probe a known land point that previously returned null. The Şems-1 SPP site in Nakhchivan is a useful canary — was null, should return ~795.83 m:
+
+```bash
+curl -s "http://localhost:5000/v1/copernicus30m?locations=39.217,45.285&interpolation=nearest"
+```
+
+### Bit-exact verification (sanity check)
+
+Before trusting a new source, confirm pixel-for-pixel equivalence on a tile present in both sources. Compare against an existing AWS tile (e.g. N47E011):
+
+```bash
+for ll in "11.1 47.1" "11.9 47.1" "11.5 47.5" "11.4242 47.5151"; do
+  a=$(gdallocationinfo -valonly -geoloc /var/opentopodata/data/copernicus30m/N47E011.tif $ll)
+  b=$(gdallocationinfo -valonly -geoloc /path/to/opentopo_N47E011.tif $ll)
+  echo "$ll  aws=$a  otopo=$b"
+done
+# Values should match to floating-point precision.
+```
 
 ## Non-Obvious Conventions
 
