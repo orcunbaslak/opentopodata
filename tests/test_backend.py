@@ -348,3 +348,62 @@ class TestGetElevation:
         assert all(z)
         assert all(np.isfinite(z))
         assert names == [SRTM_DATASET_NAME] * len(lats)
+
+
+class TestApplyBoundaryNudge:
+    """Symmetric nudge around integer-degree tile boundaries.
+    See pvxai/pvx#785: the previous one-sided nudge let east/north
+    near-edges (frac > 1 - NUDGE) fall in the half-pixel sliver beyond
+    the pixel-centre extent reported by GDAL, returning null at every
+    integer boundary and producing vertical 0-strips on the client."""
+
+    def test_low_edge_nudges_forward(self):
+        # lat=47.0 is the south edge of an N47 tile; lon=11.0 the west.
+        # Both should move into the interior of (N47, E011).
+        lats, lons = backend._apply_boundary_nudge(
+            np.array([47.0]), np.array([11.0])
+        )
+        assert lats[0] == pytest.approx(47.0 + backend._BOUNDARY_NUDGE)
+        assert lons[0] == pytest.approx(11.0 + backend._BOUNDARY_NUDGE)
+
+    def test_high_edge_nudges_backward(self):
+        # lat=47.9999 / lon=11.9999 are the north/east near-edges of the
+        # same tile; without symmetric nudge these fall outside the
+        # pixel-centre extent and return null.
+        lats, lons = backend._apply_boundary_nudge(
+            np.array([47.9999]), np.array([11.9999])
+        )
+        assert lats[0] == pytest.approx(47.0 + (1 - backend._BOUNDARY_NUDGE))
+        assert lons[0] == pytest.approx(11.0 + (1 - backend._BOUNDARY_NUDGE))
+
+    def test_interior_unchanged(self):
+        lats_in = np.array([47.5, 47.123, 47.999])
+        lons_in = np.array([11.5, 11.4, 11.001])
+        lats_out, lons_out = backend._apply_boundary_nudge(lats_in, lons_in)
+        assert np.allclose(lats_out, lats_in)
+        assert np.allclose(lons_out, lons_in)
+
+    def test_negative_latitude_high_edge(self):
+        # In the southern hemisphere the floor of -47.0001 is -48.
+        # frac = -47.0001 - (-48) = 0.9999 → high-edge, must nudge
+        # backward to -48 + (1 - NUDGE) = -47.0005, NOT to -47.9995.
+        lats, lons = backend._apply_boundary_nudge(
+            np.array([-47.0001]), np.array([0.0])
+        )
+        assert lats[0] == pytest.approx(-47.0 - backend._BOUNDARY_NUDGE)
+
+    def test_does_not_mutate_input(self):
+        lats_in = np.array([47.0, 47.9999])
+        lons_in = np.array([11.0, 11.9999])
+        lats_in_copy = lats_in.copy()
+        lons_in_copy = lons_in.copy()
+        backend._apply_boundary_nudge(lats_in, lons_in)
+        assert np.array_equal(lats_in, lats_in_copy)
+        assert np.array_equal(lons_in, lons_in_copy)
+
+    def test_empty_arrays(self):
+        lats, lons = backend._apply_boundary_nudge(
+            np.array([], dtype=float), np.array([], dtype=float)
+        )
+        assert len(lats) == 0
+        assert len(lons) == 0
